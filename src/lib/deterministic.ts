@@ -29,13 +29,18 @@ export function deterministicAnalysis(profile: Profile, rawInput = ""): Analysis
     "data_sparse",
   ];
 
+  // Risks claim the top two risk-flavored signals first; insights then fill
+  // from the *remaining* pool so we never surface the same finding in both
+  // sections with the same wording.
   const riskPool = signals.filter((s) => RISK_KINDS.includes(s.kind));
-  const insightPool = signals;
+  const risks = pickRisks(riskPool, profile);
+  const claimed = new Set(risks.map((r) => r.title));
+  const insightPool = signals.filter((s) => !claimed.has(s.title));
 
   return {
     summary: buildSummary(profile, signals),
     insights: pickInsights(insightPool, profile),
-    risks: pickRisks(riskPool, profile),
+    risks,
     recommendation: buildRecommendation(signals),
   };
 }

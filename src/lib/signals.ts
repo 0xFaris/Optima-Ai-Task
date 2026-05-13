@@ -274,35 +274,69 @@ function pushProseNumberSignals(
   ctx: TextSignalContext,
   out: BusinessSignal[]
 ) {
+  // Already-claimed percentages (any kind:"churn"|"growth"|"decline") shouldn't
+  // also become generic growth/decline signals.
+  const claimedValues = new Set(
+    out
+      .filter((s) => s.metric && /%/.test(s.metric))
+      .map((s) => s.metric!.replace(/[^0-9.]/g, ""))
+  );
   for (const n of p.numbers) {
-    const ctxLower = n.context.toLowerCase();
-    // Growth or decline percentage tied to a directional word.
-    if (n.unit === "%" && Math.abs(n.value) >= 3) {
-      const isDown = /down|drop|decline|decrease|fell|lost|miss|behind|slow|soft/.test(ctxLower);
-      const isUp = /up|grew|growth|increase|rose|gain|ahead/.test(ctxLower);
-      if (isDown) {
-        out.push({
-          kind: "decline",
-          title: `${n.value}% decline cited in notes`,
-          evidence: `"…${n.context}…"`,
-          metric: `-${n.value}%`,
-          severity: n.value >= 15 ? "High" : n.value >= 7 ? "Medium" : "Low",
-          confidence: "Medium",
-          score: 68 + Math.min(20, Math.abs(n.value)),
-        });
-      } else if (isUp) {
-        out.push({
-          kind: "growth",
-          title: `${n.value}% growth cited in notes`,
-          evidence: `"…${n.context}…"`,
-          metric: `+${n.value}%`,
-          severity: "Low",
-          confidence: "Medium",
-          score: 50 + Math.min(15, n.value),
-        });
-      }
+    if (n.unit !== "%" || Math.abs(n.value) < 3) continue;
+    if (claimedValues.has(String(n.value))) continue;
+
+    // Find the directional word *closest* to this number's position in the
+    // full input — not anywhere in a 30-char window, which produced false
+    // positives when "down" and "up" both appeared nearby.
+    const idx = ctx.input.indexOf(n.context);
+    if (idx < 0) continue;
+    const numIdx = idx + n.context.indexOf(String(n.value));
+    const direction = closestDirection(ctx.lower, numIdx);
+    if (!direction) continue;
+
+    if (direction === "down") {
+      out.push({
+        kind: "decline",
+        title: `${n.value}% decline cited in notes`,
+        evidence: `"…${n.context}…"`,
+        metric: `-${n.value}%`,
+        severity: n.value >= 15 ? "High" : n.value >= 7 ? "Medium" : "Low",
+        confidence: "Medium",
+        score: 68 + Math.min(20, Math.abs(n.value)),
+      });
+    } else {
+      out.push({
+        kind: "growth",
+        title: `${n.value}% growth cited in notes`,
+        evidence: `"…${n.context}…"`,
+        metric: `+${n.value}%`,
+        severity: "Low",
+        confidence: "Medium",
+        score: 50 + Math.min(15, n.value),
+      });
     }
   }
+}
+
+const DOWN_WORDS = ["down", "drop", "decline", "decrease", "fell", "miss", "behind", "slow", "soft"];
+const UP_WORDS = ["up ", "grew", "growth", "increase", "rose", "gain", "ahead"];
+
+type Dir = "up" | "down";
+function closestDirection(lower: string, anchor: number): Dir | null {
+  let best: { dir: Dir; dist: number } | null = null;
+  const consider = (word: string, dir: Dir) => {
+    let from = 0;
+    while (true) {
+      const i = lower.indexOf(word, from);
+      if (i === -1) break;
+      const d = Math.abs(i - anchor);
+      if (d <= 25 && (best === null || d < best.dist)) best = { dir, dist: d };
+      from = i + word.length;
+    }
+  };
+  for (const w of DOWN_WORDS) consider(w, "down");
+  for (const w of UP_WORDS) consider(w, "up");
+  return best ? (best as { dir: Dir; dist: number }).dir : null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,29 +368,50 @@ function countAny(ctx: TextSignalContext, terms: string[]): number {
   return count;
 }
 
-// Find a percentage that sits within ~40 chars of any of the supplied terms.
+// Find the percentage *closest* to any of the supplied terms, preferring a
+// percentage that follows the term (e.g. "churn 4.1%") over one that precedes
+// it. Returns the closest pair across all term occurrences.
 function findPctNear(
   ctx: TextSignalContext,
   terms: string[]
 ): (Hit & { value: number; metric: string }) | null {
+  // Collect every percentage in the input once.
   const pctRe = /(\d+(?:\.\d+)?)\s*%/g;
+  const pcts: Array<{ index: number; value: number }> = [];
   let m: RegExpExecArray | null;
   while ((m = pctRe.exec(ctx.input)) !== null) {
-    const span = { start: Math.max(0, m.index - 40), end: Math.min(ctx.input.length, m.index + 40) };
-    const window = ctx.lower.slice(span.start, span.end);
-    const hitTerm = terms.find((t) => window.includes(t));
-    if (hitTerm) {
-      const v = Number(m[1]);
-      return {
-        index: span.start,
-        length: span.end - span.start,
-        match: `${hitTerm} ${v}%`,
-        value: v,
-        metric: `${v}%`,
-      };
+    pcts.push({ index: m.index, value: Number(m[1]) });
+  }
+  if (pcts.length === 0) return null;
+
+  let best: { dist: number; pct: { index: number; value: number }; term: string } | null = null;
+  for (const term of terms) {
+    let from = 0;
+    while (true) {
+      const ti = ctx.lower.indexOf(term, from);
+      if (ti === -1) break;
+      for (const p of pcts) {
+        // Bias: a percentage *after* the term within 30 chars is most likely
+        // the value being described. We weight following-pcts as half the
+        // measured distance, so they win ties.
+        const raw = p.index - ti;
+        const bias = raw >= 0 ? 0.5 : 1;
+        const dist = Math.abs(raw) * bias;
+        if (dist > 40) continue;
+        if (!best || dist < best.dist) best = { dist, pct: p, term };
+      }
+      from = ti + term.length;
     }
   }
-  return null;
+  if (!best) return null;
+  const v = best.pct.value;
+  return {
+    index: best.pct.index,
+    length: 1,
+    match: `${best.term} ${v}%`,
+    value: v,
+    metric: `${v}%`,
+  };
 }
 
 function gradeChurnSeverity(pct: number): SignalSeverity {
