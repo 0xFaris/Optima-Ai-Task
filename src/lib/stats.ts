@@ -1,5 +1,12 @@
 import Papa from "papaparse";
 
+export type Trend = {
+  column: string;
+  firstBucketAvg: number;
+  lastBucketAvg: number;
+  deltaPct: number;
+};
+
 export type Profile =
   | {
       kind: "csv";
@@ -9,7 +16,7 @@ export type Profile =
       columns: ColumnProfile[];
       headRows: Record<string, string>[];
       dateColumn?: string;
-      trend?: { column: string; firstBucketAvg: number; lastBucketAvg: number; deltaPct: number };
+      trend?: Trend;
     }
   | {
       kind: "text";
@@ -69,7 +76,7 @@ function profileCsv(input: string, truncated: boolean): Profile {
   const columns: ColumnProfile[] = headers.map((name) => profileColumn(name, rows));
 
   const dateCol = columns.find((c) => c.detectedType === "date")?.name;
-  let trend: Profile["trend"] | undefined;
+  let trend: Trend | undefined;
   if (dateCol) {
     const numericCol = columns.find((c) => c.detectedType === "number");
     if (numericCol) {
@@ -137,7 +144,7 @@ function computeTrend(
   rows: Record<string, string>[],
   dateCol: string,
   numCol: string
-): { column: string; firstBucketAvg: number; lastBucketAvg: number; deltaPct: number } | undefined {
+): Trend | undefined {
   const points = rows
     .map((r) => ({
       t: Date.parse(r[dateCol] ?? ""),
