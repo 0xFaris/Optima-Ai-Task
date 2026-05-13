@@ -1,0 +1,23 @@
+date,region,sales_rep,product,units,revenue,deal_status
+2025-01-05,Northeast,A. Patel,Pro,12,$14400,closed-won
+2025-01-08,Northeast,A. Patel,Pro,8,9600,closed-won
+2025-01-11,South,B. Lee,Starter,22,4400,closed-won
+2025-01-15,Northeast,A. Patel,Pro,15,$18,000,closed-won
+2025-01-18,West,C. Nguyen,Pro,4,4800,closed-lost
+2025-01-22,Northeast,A. Patel,Enterprise,2,48000,closed-won
+2025-02-02,South,B. Lee,Starter,18,3600,closed-won
+2025-02-09,South,B. Lee,Starter,,2200,closed-won
+2025-02-12,Northeast,A. Patel,Pro,11,13200,closed-won
+2025-02-15,West,C. Nguyen,Pro,6,7200,open
+2025-02-18,Northeast,A. Patel,Enterprise,1,24000,closed-won
+2025-02-22,Midwest,D. Garcia,Pro,9,10800,closed-won
+2025-03-01,South,B. Lee,Starter,14,2800,closed-won
+2025-03-04,Northeast,A. Patel,Pro,13,15600,open
+2025-03-08,West,C. Nguyen,Pro,3,3600,closed-lost
+2025-03-11,Northeast,A. Patel,Enterprise,3,72000,closed-won
+2025-03-15,South,B. Lee,Starter,9,1800,closed-won
+2025-03-18,Midwest,D. Garcia,Pro,7,8400,closed-lost
+2025-03-22,Northeast,A. Patel,Pro,10,12000,closed-won
+2025-03-25,Northeast,A. Patel,Enterprise,2,48000,open
+2025-03-28,West,C. Nguyen,Pro,2,2400,closed-lost
+2025-03-30,South,B. Lee,Starter,6,1200,closed-lost
