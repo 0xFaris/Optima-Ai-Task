@@ -163,7 +163,7 @@ function buildSummary(profile: Profile, signals: BusinessSignal[]): string {
     profile.kind === "csv"
       ? `${profile.rowCount} rows × ${profile.columnCount} columns`
       : profile.kind === "text"
-      ? `${profile.lineCount} lines · ${profile.numbers.length} numeric mentions`
+      ? `${profile.lineCount} line${profile.lineCount === 1 ? "" : "s"} · ${profile.numbers.length} numeric mention${profile.numbers.length === 1 ? "" : "s"}`
       : "no data";
   if (signals.length === 0) {
     return `${shape}. No business signals strong enough to flag — try richer input.`;
