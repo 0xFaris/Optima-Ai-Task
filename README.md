@@ -1,19 +1,76 @@
 # Tiny Insight Dashboard
 
-A small Next.js app that takes a messy business dataset (CSV) or pasted free-text notes and returns **3 insights, 2 risks, and 1 recommended action**.
+A small Next.js app that takes messy business data (CSV) or pasted free-text notes and returns a **summary**, **3 insights**, **2 risks**, and **1 recommended action** — each carrying a confidence/severity/priority tag so you can prioritize at a glance.
 
-The brief asked for judgment and UX over polish, so the design optimizes for two things: outputs that are actually useful, and a single paste-and-go flow.
+The brief asks for *judgment* over polish. The design optimizes for two things: outputs that feel like they came from a smart analyst, and a single paste-and-go flow you can demo without setup.
 
-## How it works
+## Reasoning flow
 
-Two-stage **hybrid analysis**. The two stages are independently useful — that's the design, not an accident:
+Three stages run in order. Each stage's output is fed forward — and each stage is also independently useful on its own:
 
-1. **Deterministic profiling + analysis** — `src/lib/stats.ts` parses input (CSV via `papaparse` or free text), infers column types, computes missingness, ranges, top categories, detects rough trends, and extracts numeric mentions from prose. `src/lib/deterministic.ts` then turns that profile into a *complete* 3-insights / 2-risks / 1-action result on its own (concentration, trend reversal, data-quality flags for CSV; magnitude, sentiment direction, and recurring themes for text). This is the "floor" — what the tool can say with zero LLM cost.
-2. **LLM framing** — when `ANTHROPIC_API_KEY` is set, `src/lib/analyze.ts` sends the raw input **plus** the deterministic profile to Claude Opus 4.7 with a strict system prompt that forbids inventing numbers. The response is validated against a Zod schema (`src/lib/schema.ts`); a malformed response is retried once with the parse error fed back to the model.
+```
+   raw paste
+       │
+       ▼
+┌───────────────────────────┐
+│ 1. Profile (stats.ts)     │  normalize whitespace, parse CSV vs text,
+│                           │  infer column types, missingness, ranges,
+│                           │  numeric mentions in prose
+└──────────────┬────────────┘
+               ▼
+┌───────────────────────────┐
+│ 2. Signals (signals.ts)   │  ranked, named business patterns:
+│                           │  growth, decline, churn, customer/category
+│                           │  concentration, outliers, missing data,
+│                           │  support degradation, delays, cash/runway,
+│                           │  single-source dependency, sentiment
+└──────────────┬────────────┘
+               ▼
+┌───────────────────────────────────────────────────────────┐
+│ 3a. Deterministic (deterministic.ts) — always runs        │
+│     turns the top signals into a complete 3/2/1 result    │
+│     with confidence + severity + priority. This is the    │
+│     "stats-only" floor, served with zero LLM cost.        │
+├───────────────────────────────────────────────────────────┤
+│ 3b. LLM framing (analyze.ts) — only if an API key is set  │
+│     Claude receives raw input + Profile + Signals and     │
+│     reshapes them into consultant-grade prose. Output is  │
+│     schema-validated (Zod) and semantically validated     │
+│     (validate.ts) for duplicates / generics / hallucinated│
+│     numbers / unconnected recommendations. One retry on   │
+│     failure, then graceful fallback to 3a.                │
+└───────────────────────────────────────────────────────────┘
+```
 
-**Graceful degradation.** If the API key is missing, the LLM call fails, or the model returns invalid JSON twice, the tool falls back to the deterministic result and surfaces a **"STATS-ONLY"** badge in the UI explaining what happened. The submission works out-of-the-box without an API key.
+The key idea: stage 2 (signals) is where the *business* judgment lives. It converts numbers into named patterns ("47% concentration on Acme Corp", "+12% growth cited", "missing 31% of `units`") that downstream stages can ground claims against. Without it, the LLM has to invent the framing; with it, the LLM mostly picks and writes prose around already-found patterns.
 
-The UI also exposes the underlying profile under a **"Show extracted stats"** disclosure so you can verify nothing was invented.
+## Output shape
+
+```json
+{
+  "summary": "…",
+  "insights": [
+    { "title": "…", "evidence": "…", "impact": "…", "confidence": "High|Medium|Low" }
+  ],
+  "risks": [
+    { "title": "…", "severity": "High|Medium|Low", "reason": "…", "confidence": "…" }
+  ],
+  "recommendation": {
+    "action": "…", "reasoning": "…", "priority": "High|Medium|Low"
+  }
+}
+```
+
+## Validation layer (`validate.ts`)
+
+After Zod accepts the LLM response, four extra checks run before we trust it:
+
+1. **No near-duplicate insights or risks** (60%+ word overlap is rejected).
+2. **No generic platitudes** — a small blocklist catches phrases like "may improve", "monitor closely", "focus on growth".
+3. **Numeric grounding** — every cited `X%` or `$Y` is grepped against the raw input; un-grounded numbers are rejected.
+4. **Recommendation must reference findings** — at least one content word (>4 chars) from an insight or risk title must appear in the recommendation prose.
+
+If any rule fails, the parser feeds the error back to the model and asks once for a retry. After two failures the tool falls back to the deterministic result rather than showing a flawed one.
 
 ## Run locally
 
@@ -24,55 +81,22 @@ pnpm install
 pnpm dev
 ```
 
-Open <http://localhost:3000> (or whatever port Next.js picks). Click **Try sample data** then **Analyze** to see the deterministic half end-to-end immediately — no API key required.
+Open <http://localhost:3000>. Click **Try sample** then **Analyze** to see the deterministic half end-to-end immediately — no API key required.
 
-For the full **Hybrid** mode (LLM-framed prose), add a key:
+For the full **Hybrid** mode, paste your API key into the in-browser **Settings** panel (top right) — it's sent only with the request and never stored server-side. You can also keep it in `localStorage` via the "Remember in this browser" toggle, or use `.env.local`:
 
 ```bash
 cp .env.local.example .env.local
-# edit .env.local and set ANTHROPIC_API_KEY=sk-ant-...
+# edit and set ANTHROPIC_API_KEY=sk-ant-...
 pnpm dev
 ```
 
-### Environment
+### Environment / settings
 
-| Variable | Required | Default | Notes |
+| Setting | Source | Default | Notes |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | yes | — | Your Anthropic API key |
-| `ANALYSIS_MODEL` | no | `claude-opus-4-7` | Swap for `claude-sonnet-4-6` to trade judgment quality for cost |
-
-## AI tools used
-
-- **Authoring**: The code in this repo was written with **Claude Code (Opus 4.7)** in a single planning + implementation session. Planning was done up-front with explicit choices (web vs CLI, hybrid vs pure-LLM, Next.js vs Python), then implemented top-to-bottom.
-- **Runtime**: The app itself calls **Claude Opus 4.7** via the Anthropic SDK for the analysis step. I chose Opus over Sonnet because the brief weights *judgment* highly — Sonnet is faster and cheaper but I wanted the model with the strongest reasoning for the demo. The `ANALYSIS_MODEL` env var lets you switch.
-- **Prompt caching**: the system prompt is marked `cache_control: ephemeral` so repeated requests pay reduced token cost on the system block.
-
-## Validation
-
-I treated this as a "do the outputs hold up?" question rather than a unit-test question, since the value is in the judgment, not in any single function.
-
-- **Three fixtures**, run end-to-end in both modes:
-  - `public/sample.csv` — a messy sales CSV (mixed currency formats `$14400` vs `$18,000`, one blank `units` cell, mixed `closed-won` / `closed-lost` / `open` statuses, 4 regions, 4 reps, 3 products).
-  - A pasted notes blob ("Q1 revenue 1.2M, down 8% YoY; churn 4.1%; NPS 38; two enterprise deals slipped to Q2") to confirm free-text inputs produce grounded insights.
-  - A 3-row CSV edge case to confirm the deterministic + LLM passes degrade gracefully (acknowledge sparse data instead of inventing trends).
-- **Cross-check**: every numeric claim in the output was reconciled against the "Show extracted stats" panel. Two early bugs surfaced:
-  - The text regex was matching `1` inside `Q1` — fixed with a `(?<![A-Za-z])` lookbehind.
-  - "Largest figure" was comparing `38` vs `1.2M` without unit normalization — fixed by ranking on unit-normalized magnitude (`k`/`m`/`b`).
-- **Schema enforcement**: a malformed JSON response triggers one automatic retry with the parse error fed back. After two failures the tool falls back to the deterministic result rather than showing a broken state.
-- **Empty / undersized input**: the API rejects inputs under 20 chars before any analysis runs.
-- **Graceful degradation**: confirmed end-to-end that with no `ANTHROPIC_API_KEY`, the page still produces sensible 3/2/1 output with a clearly labeled `STATS-ONLY` badge.
-
-## What I'd improve next
-
-In order of impact, if I had another half-day on this:
-
-1. **Stream the response.** A 5–10s wait for Opus feels slow even when the output is good. Streaming partial sections (Insights first, then Risks, then Action) would make it feel ~instant.
-2. **Citation overlay.** Each insight already references specific values; clicking one should scroll/highlight the relevant rows in the source CSV. This is the obvious UX leap for trust.
-3. **Multi-document diff.** "This month's CSV vs last month's" is the actual business question; today the tool only sees one snapshot.
-4. **Confidence per insight.** Currently every insight reads with equal weight. A 1–5 confidence score (or a "thin signal" tag) would help users prioritize.
-5. **Pluggable profilers.** The current `buildProfile` is one function; splitting it into registered profilers (CSV / JSON / log lines / meeting notes) would let the tool grow without `if/else` sprawl.
-6. **Persist + share.** A short shareable URL backed by hashed input would make this useful for "show this to the team," not just personal exploration.
-7. **Schema-first refusal.** Today an LLM-invented number that *happens* to look plausible would slip through. A post-validation step that greps each cited number against the raw input would be a much stronger guardrail than relying on the prompt.
+| API key | Settings panel or `ANTHROPIC_API_KEY` | — | Required for hybrid mode |
+| Model | Settings panel or `ANALYSIS_MODEL` | `claude-opus-4-7` | Pick Opus / Sonnet / Haiku from the picker |
 
 ## File map
 
@@ -80,22 +104,32 @@ In order of impact, if I had another half-day on this:
 src/
   app/
     api/analyze/route.ts   POST handler; validates input, calls analyze()
-    layout.tsx
-    page.tsx               Single-page UI (paste/upload/analyze + results)
+    layout.tsx             root layout
+    page.tsx               UI: paste/upload, settings panel, chip-tagged results
     globals.css
   lib/
-    schema.ts              Zod schema for the LLM response
-    prompt.ts              System prompt
-    stats.ts               Deterministic CSV / text profiler
-    deterministic.ts       Stats-only fallback analyzer (3 insights / 2 risks / 1 action)
-    analyze.ts             Anthropic call + zod validation + 1 retry, falls back to deterministic
+    schema.ts              Zod schema for the final 3/2/1 output
+    stats.ts               CSV + text profiler (normalize, types, missing, trend)
+    signals.ts             Business analysis layer — ranked BusinessSignal[]
+    deterministic.ts       Signals → complete 3/2/1 result (stats-only floor)
+    prompt.ts              LLM system prompt (consultant framing, anti-hallucination)
+    analyze.ts             Anthropic call + parse + schema + semantic validation + retry
+    validate.ts            Duplicate / generic-phrase / grounding / connection checks
 public/
   sample.csv               Messy sales fixture for the "Try sample" button
 ```
 
-## Submission
+## What I'd improve next (production-grade roadmap)
 
-This repo is the deliverable. To turn it into either submission form:
+1. **Streaming responses.** A 5–10s wait for Opus feels slow even when the output is good. Streaming the summary first, then insights, then risks, then the action would make it feel ~instant.
+2. **Citation overlay.** Each insight already references specific values; clicking one should scroll/highlight the matching row in the source CSV. This is the obvious UX leap for trust.
+3. **Multi-snapshot diff.** "This month's CSV vs last month's" is the actual business question; today the tool only sees one snapshot. The signals layer is already a natural diff surface — same kinds, different magnitudes.
 
-- **GitHub**: `git remote add origin <url> && git push -u origin main`
-- **ZIP**: `zip -r tiny-insight-dashboard.zip . -x 'node_modules/*' -x '.next/*' -x '.env.local'`
+## How the improvements raise judgment quality
+
+- **Signals layer separates "find" from "write"**, so the LLM stops inventing framing and focuses on prose. This is the single biggest quality lift.
+- **Confidence + severity tags** force the model to admit when a signal is thin instead of overclaiming — and let the reader prioritize at a glance.
+- **Numeric grounding check** stops the most common hallucination class (a plausible-looking percentage that isn't in the data).
+- **Recommendation-must-connect-to-findings rule** kills floating advice that doesn't answer the data in front of it.
+- **Anti-generic blocklist** strips out the "monitor closely / may improve" filler that makes AI output feel anonymous.
+- **Deterministic fallback uses the same signal pipeline**, so the stats-only mode is genuinely useful — not a degraded placeholder.

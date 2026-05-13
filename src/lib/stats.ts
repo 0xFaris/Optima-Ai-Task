@@ -34,14 +34,20 @@ export type ColumnProfile = {
   missingPct: number;
   unique: number;
   numeric?: { min: number; max: number; mean: number; median: number };
+  // Retained numeric values let downstream signal extraction compute z-scores
+  // and outlier counts without re-parsing the rows.
+  values?: number[];
   top?: Array<{ value: string; count: number }>;
 };
 
 const MAX_CHARS = 8000;
 
 export function buildProfile(rawInput: string): { profile: Profile; truncatedInput: string } {
-  const truncated = rawInput.length > MAX_CHARS;
-  const input = truncated ? rawInput.slice(0, MAX_CHARS) : rawInput;
+  // Normalize: collapse internal whitespace, strip BOM, trim. This makes regex
+  // patterns robust to copy-pasted text from PDFs / Word / Slack.
+  const cleaned = normalize(rawInput);
+  const truncated = cleaned.length > MAX_CHARS;
+  const input = truncated ? cleaned.slice(0, MAX_CHARS) : cleaned;
 
   if (!input.trim()) {
     return { profile: { kind: "empty" }, truncatedInput: input };
@@ -53,8 +59,17 @@ export function buildProfile(rawInput: string): { profile: Profile; truncatedInp
   return { profile: profileText(input, truncated), truncatedInput: input };
 }
 
+function normalize(raw: string): string {
+  return raw
+    .replace(/^﻿/, "")          // strip BOM
+    .replace(/\r\n?/g, "\n")          // normalize line endings
+    .replace(/[ \t]+\n/g, "\n")       // trailing whitespace on each line
+    .replace(/\n{3,}/g, "\n\n")       // collapse 3+ blank lines
+    .trim();
+}
+
 function looksLikeCsv(input: string): boolean {
-  const lines = input.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const lines = input.split(/\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return false;
   const firstCommas = (lines[0].match(/,/g) || []).length;
   const secondCommas = (lines[1].match(/,/g) || []).length;
@@ -126,6 +141,7 @@ function profileColumn(name: string, rows: Record<string, string>[]): ColumnProf
       mean: round(sorted.reduce((a, b) => a + b, 0) / sorted.length),
       median: round(sorted[Math.floor(sorted.length / 2)]),
     };
+    profile.values = numericValues;
   }
 
   if (detectedType === "category" || detectedType === "text") {
@@ -168,7 +184,7 @@ function computeTrend(
 }
 
 function profileText(input: string, truncated: boolean): Profile {
-  const lines = input.split(/\r?\n/);
+  const lines = input.split(/\n/);
   // Lookbehind prevents matching "1" inside "Q1" or "FY25". Trailing unit captured if present.
   const numberRegex = /(?<![A-Za-z])(-?\$?\d[\d,]*(?:\.\d+)?)\s*(%|k|m|bn|b|million|thousand|pts|bps|days?|weeks?|months?)?(?![A-Za-z0-9])/gi;
   const numbers: Array<{ value: number; unit: string | null; context: string }> = [];

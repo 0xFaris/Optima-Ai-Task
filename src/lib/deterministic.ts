@@ -1,260 +1,298 @@
-import type { Analysis } from "./schema";
-import type { Profile, ColumnProfile } from "./stats";
+import type { Analysis, Confidence, Insight, Recommendation, Risk } from "./schema";
+import type { Profile } from "./stats";
+import { extractSignals, type BusinessSignal, type SignalKind } from "./signals";
 
-export function deterministicAnalysis(profile: Profile): Analysis {
-  if (profile.kind === "csv") return csvAnalysis(profile);
-  if (profile.kind === "text") return textAnalysis(profile);
-  return emptyAnalysis();
+// Deterministic analyzer — runs the signal extractor and shapes the strongest
+// signals into a complete 3-insights / 2-risks / 1-recommendation result.
+// This is what the tool can say with zero LLM cost.
+export function deterministicAnalysis(profile: Profile, rawInput = ""): Analysis {
+  if (profile.kind === "empty") return emptyAnalysis();
+
+  const signals = extractSignals(rawInput, profile);
+
+  // Several signal kinds can be either an insight or a risk depending on
+  // direction. The split below keeps the deterministic fallback consistent
+  // with the UI's "insight vs risk" labels.
+  const RISK_KINDS: SignalKind[] = [
+    "decline",
+    "churn",
+    "missing_data",
+    "support_degradation",
+    "delay_or_slippage",
+    "cash_or_runway",
+    "dependency",
+    "customer_concentration",
+    "category_concentration",
+    "outlier_row",
+    "anomaly",
+    "negative_sentiment",
+    "data_sparse",
+  ];
+
+  const riskPool = signals.filter((s) => RISK_KINDS.includes(s.kind));
+  const insightPool = signals;
+
+  return {
+    summary: buildSummary(profile, signals),
+    insights: pickInsights(insightPool, profile),
+    risks: pickRisks(riskPool, profile),
+    recommendation: buildRecommendation(signals),
+  };
 }
 
-type CsvProfile = Extract<Profile, { kind: "csv" }>;
-type TextProfile = Extract<Profile, { kind: "text" }>;
+// ─────────────────────────────────────────────────────────────────────────────
+// Builders
+// ─────────────────────────────────────────────────────────────────────────────
 
-function csvAnalysis(p: CsvProfile): Analysis {
-  const insights: Analysis["insights"] = [];
-  const risks: Analysis["risks"] = [];
-
-  const conc = topConcentratedCategory(p);
-  const numericCol = p.columns.find((c) => c.detectedType === "number" && c.numeric);
-  const missingCol = [...p.columns]
-    .filter((c) => c.missingPct > 0)
-    .sort((a, b) => b.missingPct - a.missingPct)[0];
-
-  if (p.trend) {
-    const dir = p.trend.deltaPct >= 0 ? "up" : "down";
-    insights.push({
-      title: `${p.trend.column} trended ${dir} ${Math.abs(p.trend.deltaPct).toFixed(1)}% over the period`,
-      evidence: `First-half avg ${fmt(p.trend.firstBucketAvg)} → last-half avg ${fmt(p.trend.lastBucketAvg)}.`,
-    });
+function pickInsights(signals: BusinessSignal[], profile: Profile): [Insight, Insight, Insight] {
+  const out: Insight[] = [];
+  const seenKinds = new Set<SignalKind>();
+  for (const s of signals) {
+    if (out.length >= 3) break;
+    if (seenKinds.has(s.kind)) continue;
+    seenKinds.add(s.kind);
+    out.push(signalToInsight(s));
   }
-
-  if (conc && conc.share >= 0.25) {
-    insights.push({
-      title: `${conc.value} accounts for ${pct(conc.share)} of ${conc.column}`,
-      evidence: `${conc.count} of ${p.rowCount} rows.`,
-    });
+  while (out.length < 3) {
+    out.push(structuralInsight(profile, out.length));
   }
-
-  if (numericCol && numericCol.numeric) {
-    const { min, max, mean, median } = numericCol.numeric;
-    const skew = Math.abs(mean - median) / Math.max(1, Math.abs(mean));
-    insights.push({
-      title: `${numericCol.name} ranges ${fmt(min)}–${fmt(max)} (mean ${fmt(mean)})`,
-      evidence:
-        skew > 0.25
-          ? `Mean ${fmt(mean)} vs median ${fmt(median)} — distribution is skewed; outliers present.`
-          : `Mean ≈ median (${fmt(mean)}/${fmt(median)}) — distribution is roughly even.`,
-    });
-  }
-
-  while (insights.length < 3) {
-    insights.push({
-      title: `${p.rowCount} rows × ${p.columnCount} columns ingested`,
-      evidence: `Columns: ${p.columns.map((c) => c.name).join(", ") || "(none)"}.`,
-    });
-  }
-  insights.length = 3;
-
-  if (conc && conc.share >= 0.4) {
-    risks.push({
-      title: `Concentration risk in ${conc.column}`,
-      why: `${pct(conc.share)} of rows are "${conc.value}" — a single failure point.`,
-    });
-  }
-  if (p.trend && p.trend.deltaPct < -10) {
-    risks.push({
-      title: `${p.trend.column} declined ${Math.abs(p.trend.deltaPct).toFixed(1)}% over the period`,
-      why: `Sustained downward trend in the primary numeric column.`,
-    });
-  }
-  if (missingCol && missingCol.missingPct > 15 && risks.length < 2) {
-    risks.push({
-      title: `${missingCol.missingPct}% of ${missingCol.name} is missing`,
-      why: `Downstream analyses using ${missingCol.name} silently drop a meaningful share of rows.`,
-    });
-  }
-  while (risks.length < 2) {
-    risks.push({
-      title: "No structural risk surfaced from the profile alone",
-      why: "Sample may be too clean or too small for the deterministic pass to flag one. Try the LLM half with an API key.",
-    });
-  }
-  risks.length = 2;
-
-  let action: Analysis["action"];
-  if (p.trend && p.trend.deltaPct < -10) {
-    action = {
-      title: `Investigate the ${Math.abs(p.trend.deltaPct).toFixed(1)}% drop in ${p.trend.column} this week`,
-      rationale: `${p.trend.column} fell from ${fmt(p.trend.firstBucketAvg)} to ${fmt(p.trend.lastBucketAvg)}. Find the driver before the next period.`,
-    };
-  } else if (conc && conc.share >= 0.4) {
-    action = {
-      title: `Build a contingency for ${conc.value} in ${conc.column}`,
-      rationale: `${pct(conc.share)} concentration means a single shift moves the whole number.`,
-    };
-  } else if (missingCol && missingCol.missingPct > 15) {
-    action = {
-      title: `Fix collection for ${missingCol.name} this week`,
-      rationale: `${missingCol.missingPct}% missingness undermines anything you compute on this column.`,
-    };
-  } else {
-    action = {
-      title: "Re-run with more data or add an API key for richer analysis",
-      rationale: "Deterministic profile is thin; LLM judgment is needed for non-obvious signal.",
-    };
-  }
-
-  return { insights, risks, action };
+  return [out[0], out[1], out[2]];
 }
 
-function textAnalysis(p: TextProfile): Analysis {
-  const insights: Analysis["insights"] = [];
-  const risks: Analysis["risks"] = [];
-
-  // Rank numeric mentions by unit-normalized magnitude.
-  const sorted = [...p.numbers].sort(
-    (a, b) => Math.abs(magnitude(b)) - Math.abs(magnitude(a))
-  );
-  const top = sorted[0];
-  const percents = p.numbers.filter((n) => n.unit === "%");
-  const biggestPct = percents.sort((a, b) => Math.abs(b.value) - Math.abs(a.value))[0];
-
-  if (top) {
-    insights.push({
-      title: `Largest figure cited: ${formatNum(top)}`,
-      evidence: `"…${top.context}…"`,
-    });
+function pickRisks(signals: BusinessSignal[], profile: Profile): [Risk, Risk] {
+  const out: Risk[] = [];
+  const seenKinds = new Set<SignalKind>();
+  for (const s of signals) {
+    if (out.length >= 2) break;
+    if (seenKinds.has(s.kind)) continue;
+    seenKinds.add(s.kind);
+    out.push(signalToRisk(s));
   }
-  if (biggestPct && biggestPct !== top) {
-    insights.push({
-      title: `Largest percentage cited: ${biggestPct.value}%`,
-      evidence: `"…${biggestPct.context}…"`,
-    });
+  while (out.length < 2) {
+    out.push(structuralRisk(profile, out.length));
   }
-  const topTerms = p.topTerms.slice(0, 5).map((t) => t.term);
-  if (topTerms.length > 0) {
-    insights.push({
-      title: `Recurring themes: ${topTerms.slice(0, 3).join(", ")}`,
-      evidence: `Top terms by frequency: ${topTerms.join(", ")}.`,
-    });
-  }
-  while (insights.length < 3) {
-    insights.push({
-      title: `${p.lineCount} line${p.lineCount === 1 ? "" : "s"} · ${p.charCount} chars · ${p.numbers.length} numeric mention${p.numbers.length === 1 ? "" : "s"}`,
-      evidence: "Deterministic pass; LLM half disabled.",
-    });
-  }
-  insights.length = 3;
-
-  const negSignals = matchSentiment(
-    p,
-    ["down", "drop", "drops", "dropped", "decline", "declines", "declined", "slip", "slipped", "lost", "miss", "missed", "churn", "behind", "delayed", "weak"]
-  );
-  if (negSignals.length > 0) {
-    risks.push({
-      title: `Negative-direction language present (${negSignals.length} signal${negSignals.length === 1 ? "" : "s"})`,
-      why: `Mentions of ${negSignals.slice(0, 3).map((s) => `"${s}"`).join(", ")} suggest movement in the wrong direction.`,
-    });
-  }
-  if (top && Math.abs(magnitude(top)) >= 1e5) {
-    risks.push({
-      title: `Material figure cited without source: ${formatNum(top)}`,
-      why: `Large number with no checksum in the notes — high blast-radius if wrong.`,
-    });
-  }
-  if (biggestPct && Math.abs(biggestPct.value) >= 5 && risks.length < 2) {
-    risks.push({
-      title: `${biggestPct.value}% movement cited`,
-      why: `A double-digit percentage swing is rarely noise — confirm the comparison window before acting.`,
-    });
-  }
-  while (risks.length < 2) {
-    risks.push({
-      title: "Insufficient signal for a structural risk",
-      why: "Free-text input is qualitative; deterministic pass cannot infer business risk without numeric anchors.",
-    });
-  }
-  risks.length = 2;
-
-  const action: Analysis["action"] =
-    negSignals.length > 0 && top
-      ? {
-          title: `Verify the ${formatNum(top)} figure and the "${negSignals[0]}" signal before circulating`,
-          rationale: "Negative direction language combined with a large unverified number is the highest-risk combination — confirm both first.",
-        }
-      : top
-      ? {
-          title: `Source-check the ${formatNum(top)} figure cited in the notes`,
-          rationale: "Largest claim in the input; most likely to drive a downstream decision.",
-        }
-      : {
-          title: "Re-paste with numeric context or enable the LLM half",
-          rationale: "Without numbers or an API key the deterministic pass has nothing concrete to recommend.",
-        };
-
-  return { insights, risks, action };
+  return [out[0], out[1]];
 }
 
-function magnitude(n: { value: number; unit: string | null }): number {
-  const u = (n.unit ?? "").toLowerCase();
-  if (u === "k" || u === "thousand") return n.value * 1e3;
-  if (u === "m" || u === "million") return n.value * 1e6;
-  if (u === "b" || u === "bn" || u === "billion") return n.value * 1e9;
-  return n.value;
+function buildRecommendation(signals: BusinessSignal[]): Recommendation {
+  const top = signals[0];
+  if (!top) {
+    return {
+      action: "Collect more structured data before acting on this snapshot",
+      reasoning: "No strong business signals surfaced from the input — recommendations would be guesses.",
+      priority: "Low",
+    };
+  }
+  const tpl = recTemplates[top.kind] ?? defaultRec;
+  return tpl(top);
 }
 
-function formatNum(n: { value: number; unit: string | null }): string {
-  const unit = n.unit ? n.unit.toUpperCase() : "";
-  return `${fmt(n.value)}${unit}`;
+const recTemplates: Partial<Record<SignalKind, (s: BusinessSignal) => Recommendation>> = {
+  decline: (s) => ({
+    action: `Investigate the ${s.metric ?? "decline"} this week and identify the single largest driver`,
+    reasoning: `${s.evidence} A sustained drop compounds — root-cause first, plan second.`,
+    priority: s.severity as Confidence,
+  }),
+  churn: (s) => ({
+    action: `Open a 7-day retention review focused on the ${s.metric ?? "churn"} cohort`,
+    reasoning: `Churn at ${s.metric ?? "elevated levels"} is far cheaper to fix early. ${s.evidence}`,
+    priority: s.severity as Confidence,
+  }),
+  cash_or_runway: () => ({
+    action: `Refresh the 13-week cash forecast and pull AR > 30 days into a recovery list this week`,
+    reasoning: `Liquidity questions deserve a checked answer, not a verbal estimate.`,
+    priority: "High",
+  }),
+  customer_concentration: (s) => ({
+    action: `Build a contingency plan for the top customer dependency before next quarter`,
+    reasoning: `${s.evidence} A single account moving the whole number is a structural exposure.`,
+    priority: s.severity as Confidence,
+  }),
+  category_concentration: (s) => ({
+    action: `Diversify the dominant segment exposure on a 90-day plan`,
+    reasoning: `${s.evidence} Concentration above ~35% leaves the topline tied to one input.`,
+    priority: s.severity as Confidence,
+  }),
+  delay_or_slippage: (s) => ({
+    action: `Re-baseline the slipping items this week with a named owner and a forcing date`,
+    reasoning: `${s.evidence} Slipping pipeline tends to slip again unless a fresh commit is set.`,
+    priority: s.severity as Confidence,
+  }),
+  support_degradation: (s) => ({
+    action: `Triage open support escalations and publish a 48-hour fix-rate target`,
+    reasoning: `${s.evidence} Service degradation visibly precedes churn — staunch the bleeding first.`,
+    priority: s.severity as Confidence,
+  }),
+  dependency: (s) => ({
+    action: `Identify a second source for the dependency cited and time-box a 30-day pilot`,
+    reasoning: `${s.evidence} Single-source dependencies are the cheapest risk to retire early.`,
+    priority: "High",
+  }),
+  missing_data: (s) => ({
+    action: `Fix the upstream capture for ${labelFromTitle(s.title)} this week before re-running analysis`,
+    reasoning: `${s.evidence} Missing data silently warps every downstream metric.`,
+    priority: s.severity as Confidence,
+  }),
+  outlier_row: (s) => ({
+    action: `Investigate the outlier row(s) flagged before treating averages as representative`,
+    reasoning: `${s.evidence} Outliers can either be the story or contaminate it — find out which.`,
+    priority: "Medium",
+  }),
+  growth: (s) => ({
+    action: `Double down on the channel driving the ${s.metric ?? "growth"} and protect it from distraction`,
+    reasoning: `${s.evidence} Concentrate effort where the data already says yes.`,
+    priority: "Medium",
+  }),
+};
+
+function defaultRec(s: BusinessSignal): Recommendation {
+  return {
+    action: `Validate the strongest signal in the input before taking action`,
+    reasoning: `${s.evidence} A single grounded check beats a broad plan when signal is thin.`,
+    priority: "Low",
+  };
+}
+
+function buildSummary(profile: Profile, signals: BusinessSignal[]): string {
+  const shape =
+    profile.kind === "csv"
+      ? `${profile.rowCount} rows × ${profile.columnCount} columns`
+      : profile.kind === "text"
+      ? `${profile.lineCount} lines · ${profile.numbers.length} numeric mentions`
+      : "no data";
+  if (signals.length === 0) {
+    return `${shape}. No business signals strong enough to flag — try richer input.`;
+  }
+  const headline = signals[0];
+  const second = signals[1];
+  const secondFragment = second ? ` Secondary: ${second.title.toLowerCase()}.` : "";
+  return `${shape}. Headline: ${headline.title}.${secondFragment}`.slice(0, 320);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal → output mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+function signalToInsight(s: BusinessSignal): Insight {
+  return {
+    title: s.title,
+    evidence: s.evidence,
+    impact: impactCopy(s),
+    confidence: s.confidence as Confidence,
+  };
+}
+
+function signalToRisk(s: BusinessSignal): Risk {
+  return {
+    title: s.title,
+    severity: s.severity as Confidence,
+    reason: s.evidence,
+    confidence: s.confidence as Confidence,
+  };
+}
+
+function impactCopy(s: BusinessSignal): string {
+  switch (s.kind) {
+    case "decline":
+      return `If sustained, compounds against the topline; root-cause matters more than the magnitude.`;
+    case "growth":
+      return `Worth protecting and pressure-testing — confirm it's not a comp-period artifact.`;
+    case "churn":
+      return `Churn flows directly through to recurring revenue — early-stage fix is the cheap one.`;
+    case "customer_concentration":
+      return `Concentrated revenue means a single account's behavior moves the entire reporting line.`;
+    case "category_concentration":
+      return `Dominant category exposure narrows resilience to demand shifts in that segment.`;
+    case "cash_or_runway":
+      return `Cash signals dictate scenario planning and should override most other prioritization.`;
+    case "missing_data":
+      return `Every metric computed on this column is implicitly biased until capture is fixed.`;
+    case "outlier_row":
+      return `Outliers either are the story or distort the averages — handle before reporting.`;
+    case "support_degradation":
+      return `Service degradation typically leads churn by 1–2 reporting cycles.`;
+    case "delay_or_slippage":
+      return `Slippage usually compounds — a fresh commit date is worth more than a status update.`;
+    case "dependency":
+      return `Single-source dependencies are the cheapest exposure to retire early.`;
+    case "retention_pressure":
+      return `Retention conversations are leading indicators — worth a dedicated review window.`;
+    case "data_sparse":
+      return `Small samples produce unstable estimates; treat conclusions as directional only.`;
+    case "negative_sentiment":
+      return `Qualitative tone is a soft signal but worth pairing with a quantitative check.`;
+    case "positive_sentiment":
+      return `Positive tone alone isn't predictive — confirm with a numeric metric.`;
+    default:
+      return `Worth a closer look — directional only without more data.`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fallbacks for sparse input
+// ─────────────────────────────────────────────────────────────────────────────
+
+function structuralInsight(profile: Profile, slot: number): Insight {
+  if (profile.kind === "csv") {
+    const cols = profile.columns.map((c) => c.name).slice(0, 6).join(", ");
+    return {
+      title: `Data shape: ${profile.rowCount} rows × ${profile.columnCount} columns`,
+      evidence: `Columns: ${cols || "(none parsed)"}.`,
+      impact: `Structural-only insight — sample is too small or too clean for a business pattern to surface deterministically.`,
+      confidence: "Low",
+    };
+  }
+  if (profile.kind === "text") {
+    return {
+      title: `Sparse signal in notes: ${profile.numbers.length} numeric mention${profile.numbers.length === 1 ? "" : "s"}`,
+      evidence: `${profile.lineCount} lines / ${profile.charCount} chars; insufficient anchors for a strong claim.`,
+      impact: `Free-text without numeric anchors limits how confidently any insight can be stated.`,
+      confidence: "Low",
+    };
+  }
+  return {
+    title: `No data ingested (slot ${slot + 1})`,
+    evidence: "Input was empty after normalization.",
+    impact: "Nothing to act on until data is provided.",
+    confidence: "Low",
+  };
+}
+
+function structuralRisk(profile: Profile, slot: number): Risk {
+  if (profile.kind === "csv" && profile.rowCount < 10) {
+    return {
+      title: "Sample size limits inference",
+      severity: "Medium",
+      reason: `${profile.rowCount} rows is below the threshold where averages or trends are statistically meaningful.`,
+      confidence: "High",
+    };
+  }
+  return {
+    title: slot === 0 ? "No structural risk surfaced from this snapshot" : "Insufficient data for a second risk",
+    severity: "Low",
+    reason: "Either the input is genuinely low-risk or the deterministic pass lacks the context to spot one — pair with an API key for LLM judgment.",
+    confidence: "Low",
+  };
 }
 
 function emptyAnalysis(): Analysis {
   return {
+    summary: "No input — paste a CSV or business notes to analyze.",
     insights: [
-      { title: "No data provided", evidence: "Input was empty after trimming." },
-      { title: "No data provided", evidence: "Input was empty after trimming." },
-      { title: "No data provided", evidence: "Input was empty after trimming." },
+      { title: "No data provided", evidence: "Input was empty after trimming.", impact: "Nothing to analyze.", confidence: "Low" },
+      { title: "No data provided", evidence: "Input was empty after trimming.", impact: "Nothing to analyze.", confidence: "Low" },
+      { title: "No data provided", evidence: "Input was empty after trimming.", impact: "Nothing to analyze.", confidence: "Low" },
     ],
     risks: [
-      { title: "No input", why: "Nothing to analyze." },
-      { title: "No input", why: "Nothing to analyze." },
+      { title: "No input", severity: "Low", reason: "Nothing to analyze.", confidence: "Low" },
+      { title: "No input", severity: "Low", reason: "Nothing to analyze.", confidence: "Low" },
     ],
-    action: { title: "Paste a CSV or notes", rationale: "Need data to produce insights." },
+    recommendation: { action: "Paste a CSV or notes", reasoning: "Need data to produce insights.", priority: "Low" },
   };
 }
 
-function topConcentratedCategory(p: CsvProfile):
-  | { column: string; value: string; count: number; share: number }
-  | undefined {
-  let best: { column: string; value: string; count: number; share: number } | undefined;
-  for (const col of p.columns) {
-    if (!col.top || col.top.length === 0 || p.rowCount === 0) continue;
-    if (col.detectedType !== "category" && col.detectedType !== "text") continue;
-    const top = col.top[0];
-    const share = top.count / p.rowCount;
-    if (!best || share > best.share) {
-      best = { column: col.name, value: top.value, count: top.count, share };
-    }
-  }
-  return best;
+function labelFromTitle(title: string): string {
+  // Extract a column name out of titles like "47% of revenue is missing".
+  const m = title.match(/of ([\w\s_]+) is missing/i);
+  return m ? m[1].trim() : "the affected column";
 }
-
-function matchSentiment(p: TextProfile, words: string[]): string[] {
-  const found: string[] = [];
-  for (const t of p.topTerms) {
-    if (words.includes(t.term)) found.push(t.term);
-  }
-  return found;
-}
-
-function fmt(n: number): string {
-  if (Number.isInteger(n)) return n.toLocaleString();
-  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
-function pct(share: number): string {
-  return `${Math.round(share * 100)}%`;
-}
-
-// kept for tree-shaking sanity
-export type _ColumnProfileRef = ColumnProfile;

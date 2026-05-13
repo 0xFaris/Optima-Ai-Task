@@ -3,50 +3,63 @@ import { AnalysisSchema, type Analysis } from "./schema";
 import { SYSTEM_PROMPT } from "./prompt";
 import { buildProfile, type Profile } from "./stats";
 import { deterministicAnalysis } from "./deterministic";
+import { extractSignals, type BusinessSignal } from "./signals";
+import { validateAnalysis } from "./validate";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
+export const SUPPORTED_MODELS = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"] as const;
+export type SupportedModel = (typeof SUPPORTED_MODELS)[number];
 
 export type AnalyzeMode = "hybrid" | "stats-only";
+
+export type AnalyzeOptions = {
+  apiKey?: string;
+  model?: string;
+};
 
 export type AnalyzeResult = {
   analysis: Analysis;
   profile: Profile;
   mode: AnalyzeMode;
+  modelUsed?: string;
   notice?: string;
 };
 
-export async function analyze(rawInput: string): Promise<AnalyzeResult> {
+export async function analyze(rawInput: string, opts: AnalyzeOptions = {}): Promise<AnalyzeResult> {
   const { profile, truncatedInput } = buildProfile(rawInput);
   if (profile.kind === "empty") {
     throw new Error("Need more data — input is empty.");
   }
 
-  const fallback = deterministicAnalysis(profile);
+  const fallback = deterministicAnalysis(profile, truncatedInput);
+  const apiKey = opts.apiKey?.trim() || process.env.ANTHROPIC_API_KEY;
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!apiKey) {
     return {
       analysis: fallback,
       profile,
       mode: "stats-only",
-      notice: "ANTHROPIC_API_KEY not set — showing the deterministic half only. Add the key for LLM-grade prose.",
+      notice: "No API key provided — showing the deterministic half. Open Settings to add one and enable LLM framing.",
     };
   }
 
+  const model = opts.model?.trim() || process.env.ANALYSIS_MODEL || DEFAULT_MODEL;
+
   try {
-    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const model = process.env.ANALYSIS_MODEL || DEFAULT_MODEL;
-    const userMessage = buildUserMessage(truncatedInput, profile);
+    const client = new Anthropic({ apiKey });
+    const signals = extractSignals(truncatedInput, profile);
+    const userMessage = buildUserMessage(truncatedInput, profile, signals);
 
     const firstAttempt = await callModel(client, model, userMessage);
-    const parsed = tryParse(firstAttempt);
-    if (parsed.ok) return { analysis: parsed.value, profile, mode: "hybrid" };
+    const parsed = parseAndValidate(firstAttempt, truncatedInput);
+    if (parsed.ok) return { analysis: parsed.value, profile, mode: "hybrid", modelUsed: model };
 
     const retry = await callModel(client, model, userMessage, {
       priorAttempt: firstAttempt,
       parseError: parsed.error,
     });
-    const reparsed = tryParse(retry);
-    if (reparsed.ok) return { analysis: reparsed.value, profile, mode: "hybrid" };
+    const reparsed = parseAndValidate(retry, truncatedInput);
+    if (reparsed.ok) return { analysis: reparsed.value, profile, mode: "hybrid", modelUsed: model };
 
     return {
       analysis: fallback,
@@ -65,16 +78,21 @@ export async function analyze(rawInput: string): Promise<AnalyzeResult> {
   }
 }
 
-function buildUserMessage(rawInput: string, profile: Profile): string {
+function buildUserMessage(rawInput: string, profile: Profile, signals: BusinessSignal[]): string {
   return [
     "Raw input:",
     "```",
     rawInput,
     "```",
     "",
-    "Deterministic Profile (use this as your source of truth for numeric claims):",
+    "Deterministic Profile (source of truth for numeric claims):",
     "```json",
     JSON.stringify(profile, null, 2),
+    "```",
+    "",
+    `Detected BusinessSignals (ranked by score; use as your shortlist of patterns — ${signals.length} found):`,
+    "```json",
+    JSON.stringify(signals, null, 2),
     "```",
     "",
     "Return ONLY the JSON object specified in the system prompt.",
@@ -110,16 +128,29 @@ async function callModel(
   return textBlock.text;
 }
 
-function tryParse(raw: string): { ok: true; value: Analysis } | { ok: false; error: string } {
+// Parse → schema-validate → semantic-validate. Any failure is returned with a
+// human-readable error string that we feed back to the model on retry.
+function parseAndValidate(
+  raw: string,
+  rawInput: string
+): { ok: true; value: Analysis } | { ok: false; error: string } {
   const cleaned = stripCodeFences(raw).trim();
+  let obj: unknown;
   try {
-    const obj = JSON.parse(cleaned);
-    const result = AnalysisSchema.safeParse(obj);
-    if (result.success) return { ok: true, value: result.data };
-    return { ok: false, error: result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+    obj = JSON.parse(cleaned);
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    return { ok: false, error: `JSON parse error: ${e instanceof Error ? e.message : String(e)}` };
   }
+  const schema = AnalysisSchema.safeParse(obj);
+  if (!schema.success) {
+    return {
+      ok: false,
+      error: schema.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
+    };
+  }
+  const semantic = validateAnalysis(schema.data, rawInput);
+  if (!semantic.ok) return semantic;
+  return { ok: true, value: schema.data };
 }
 
 function stripCodeFences(s: string): string {

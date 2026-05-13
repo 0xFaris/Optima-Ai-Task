@@ -5,7 +5,7 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 export async function POST(req: Request) {
-  let body: { input?: string };
+  let body: { input?: string; apiKey?: string; model?: string };
   try {
     body = await req.json();
   } catch {
@@ -21,12 +21,11 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await analyze(input);
+    const result = await analyze(input, { apiKey: body.apiKey, model: body.model });
     return NextResponse.json(result);
   } catch (e) {
     const message = e instanceof Error ? e.message : "Analysis failed";
-    const status = message.includes("ANTHROPIC_API_KEY") ? 500 : 502;
     console.error("[analyze] error:", message);
-    return NextResponse.json({ error: message }, { status });
+    return NextResponse.json({ error: message }, { status: 502 });
   }
 }
