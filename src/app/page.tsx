@@ -3,12 +3,13 @@
 import { useRef, useState } from "react";
 import type { Analysis } from "@/lib/schema";
 import type { Profile } from "@/lib/stats";
+import type { AnalyzeMode } from "@/lib/analyze";
 
 type State =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "error"; message: string }
-  | { kind: "ok"; analysis: Analysis; profile: Profile };
+  | { kind: "ok"; analysis: Analysis; profile: Profile; mode: AnalyzeMode; notice?: string };
 
 export default function Page() {
   const [input, setInput] = useState("");
@@ -34,7 +35,13 @@ export default function Page() {
         setState({ kind: "error", message: data.error ?? `Request failed (${res.status})` });
         return;
       }
-      setState({ kind: "ok", analysis: data.analysis, profile: data.profile });
+      setState({
+        kind: "ok",
+        analysis: data.analysis,
+        profile: data.profile,
+        mode: data.mode,
+        notice: data.notice,
+      });
     } catch (e) {
       setState({ kind: "error", message: e instanceof Error ? e.message : "Network error" });
     }
@@ -131,6 +138,7 @@ export default function Page() {
 
         {state.kind === "ok" && (
           <div className="space-y-8">
+            <ModeBadge mode={state.mode} notice={state.notice} />
             <Block label="Insights" tone="neutral">
               <ol className="space-y-4">
                 {state.analysis.insights.map((it, i) => (
@@ -191,6 +199,32 @@ export default function Page() {
         Hybrid analysis: deterministic profile → Claude shapes it into judgment-grade prose. See README for details.
       </footer>
     </main>
+  );
+}
+
+function ModeBadge({ mode, notice }: { mode: AnalyzeMode; notice?: string }) {
+  const isHybrid = mode === "hybrid";
+  return (
+    <div
+      className={`flex items-start gap-3 rounded-md border px-4 py-3 text-sm ${
+        isHybrid
+          ? "border-emerald-200 bg-emerald-50/60 text-emerald-900"
+          : "border-amber-200 bg-amber-50/60 text-amber-900"
+      }`}
+    >
+      <span
+        className={`mt-0.5 inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
+          isHybrid ? "bg-emerald-600 text-white" : "bg-amber-600 text-white"
+        }`}
+      >
+        {isHybrid ? "Hybrid" : "Stats-only"}
+      </span>
+      <span className="leading-snug">
+        {isHybrid
+          ? "Output blends the deterministic profile with Claude's framing."
+          : notice ?? "Showing the deterministic half. Add ANTHROPIC_API_KEY to enable the LLM pass."}
+      </span>
+    </div>
   );
 }
 

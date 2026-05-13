@@ -6,12 +6,14 @@ The brief asked for judgment and UX over polish, so the design optimizes for two
 
 ## How it works
 
-Two-stage **hybrid analysis**:
+Two-stage **hybrid analysis**. The two stages are independently useful — that's the design, not an accident:
 
-1. **Deterministic profiling** — `src/lib/stats.ts` parses the input (CSV via `papaparse` or free text), infers column types, computes missingness, ranges, top categories, extracts numbers and rough trends. This is the "floor" of facts the model is allowed to claim.
-2. **LLM framing** — `src/lib/analyze.ts` sends the raw input *plus* the deterministic profile to Claude Opus 4.7 with a strict system prompt that forbids inventing numbers. The response is validated against a Zod schema (`src/lib/schema.ts`); a malformed response is retried once with the parse error fed back to the model.
+1. **Deterministic profiling + analysis** — `src/lib/stats.ts` parses input (CSV via `papaparse` or free text), infers column types, computes missingness, ranges, top categories, detects rough trends, and extracts numeric mentions from prose. `src/lib/deterministic.ts` then turns that profile into a *complete* 3-insights / 2-risks / 1-action result on its own (concentration, trend reversal, data-quality flags for CSV; magnitude, sentiment direction, and recurring themes for text). This is the "floor" — what the tool can say with zero LLM cost.
+2. **LLM framing** — when `ANTHROPIC_API_KEY` is set, `src/lib/analyze.ts` sends the raw input **plus** the deterministic profile to Claude Opus 4.7 with a strict system prompt that forbids inventing numbers. The response is validated against a Zod schema (`src/lib/schema.ts`); a malformed response is retried once with the parse error fed back to the model.
 
-The UI exposes the deterministic profile under a **"Show extracted stats"** disclosure so you can verify the model didn't make anything up.
+**Graceful degradation.** If the API key is missing, the LLM call fails, or the model returns invalid JSON twice, the tool falls back to the deterministic result and surfaces a **"STATS-ONLY"** badge in the UI explaining what happened. The submission works out-of-the-box without an API key.
+
+The UI also exposes the underlying profile under a **"Show extracted stats"** disclosure so you can verify nothing was invented.
 
 ## Run locally
 
@@ -19,12 +21,18 @@ Requires Node 20+ and `pnpm` (or `npm`).
 
 ```bash
 pnpm install
+pnpm dev
+```
+
+Open <http://localhost:3000> (or whatever port Next.js picks). Click **Try sample data** then **Analyze** to see the deterministic half end-to-end immediately — no API key required.
+
+For the full **Hybrid** mode (LLM-framed prose), add a key:
+
+```bash
 cp .env.local.example .env.local
 # edit .env.local and set ANTHROPIC_API_KEY=sk-ant-...
 pnpm dev
 ```
-
-Open <http://localhost:3000>. Click **Try sample data** then **Analyze** for the fastest end-to-end check.
 
 ### Environment
 
@@ -41,15 +49,18 @@ Open <http://localhost:3000>. Click **Try sample data** then **Analyze** for the
 
 ## Validation
 
-I treated this as a "do the outputs hold up?" question rather than a unit-test question, since the value is in the model's judgment, not in any single function.
+I treated this as a "do the outputs hold up?" question rather than a unit-test question, since the value is in the judgment, not in any single function.
 
-- **Three fixtures**, run end-to-end:
+- **Three fixtures**, run end-to-end in both modes:
   - `public/sample.csv` — a messy sales CSV (mixed currency formats `$14400` vs `$18,000`, one blank `units` cell, mixed `closed-won` / `closed-lost` / `open` statuses, 4 regions, 4 reps, 3 products).
   - A pasted notes blob ("Q1 revenue 1.2M, down 8% YoY; churn 4.1%; NPS 38; two enterprise deals slipped to Q2") to confirm free-text inputs produce grounded insights.
-  - A 3-row CSV edge case to confirm the model degrades gracefully (acknowledges sparse data instead of inventing trends).
-- **Cross-check**: every numeric claim in the output was reconciled against the "Show extracted stats" panel. Two early prompt drafts let Opus invent percentages that didn't exist in the data — tightening the system prompt's "MUST appear in the Profile" rule fixed it.
-- **Schema enforcement**: a malformed JSON response triggers one automatic retry with the parse error fed back. After two failures the user sees an error, not a partial result.
-- **Empty / undersized input**: the API rejects inputs under 20 chars before any LLM call.
+  - A 3-row CSV edge case to confirm the deterministic + LLM passes degrade gracefully (acknowledge sparse data instead of inventing trends).
+- **Cross-check**: every numeric claim in the output was reconciled against the "Show extracted stats" panel. Two early bugs surfaced:
+  - The text regex was matching `1` inside `Q1` — fixed with a `(?<![A-Za-z])` lookbehind.
+  - "Largest figure" was comparing `38` vs `1.2M` without unit normalization — fixed by ranking on unit-normalized magnitude (`k`/`m`/`b`).
+- **Schema enforcement**: a malformed JSON response triggers one automatic retry with the parse error fed back. After two failures the tool falls back to the deterministic result rather than showing a broken state.
+- **Empty / undersized input**: the API rejects inputs under 20 chars before any analysis runs.
+- **Graceful degradation**: confirmed end-to-end that with no `ANTHROPIC_API_KEY`, the page still produces sensible 3/2/1 output with a clearly labeled `STATS-ONLY` badge.
 
 ## What I'd improve next
 
@@ -76,7 +87,8 @@ src/
     schema.ts              Zod schema for the LLM response
     prompt.ts              System prompt
     stats.ts               Deterministic CSV / text profiler
-    analyze.ts             Anthropic call + zod validation + 1 retry
+    deterministic.ts       Stats-only fallback analyzer (3 insights / 2 risks / 1 action)
+    analyze.ts             Anthropic call + zod validation + 1 retry, falls back to deterministic
 public/
   sample.csv               Messy sales fixture for the "Try sample" button
 ```

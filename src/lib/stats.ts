@@ -169,7 +169,8 @@ function computeTrend(
 
 function profileText(input: string, truncated: boolean): Profile {
   const lines = input.split(/\r?\n/);
-  const numberRegex = /(-?\$?\d[\d,]*\.?\d*)\s*(%|k|m|bn|b|million|thousand|pts|bps|days?|weeks?|months?|qtr|q[1-4])?/gi;
+  // Lookbehind prevents matching "1" inside "Q1" or "FY25". Trailing unit captured if present.
+  const numberRegex = /(?<![A-Za-z])(-?\$?\d[\d,]*(?:\.\d+)?)\s*(%|k|m|bn|b|million|thousand|pts|bps|days?|weeks?|months?)?(?![A-Za-z0-9])/gi;
   const numbers: Array<{ value: number; unit: string | null; context: string }> = [];
   let match: RegExpExecArray | null;
   while ((match = numberRegex.exec(input)) !== null) {

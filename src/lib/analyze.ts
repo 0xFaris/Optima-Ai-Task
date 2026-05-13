@@ -2,38 +2,67 @@ import Anthropic from "@anthropic-ai/sdk";
 import { AnalysisSchema, type Analysis } from "./schema";
 import { SYSTEM_PROMPT } from "./prompt";
 import { buildProfile, type Profile } from "./stats";
+import { deterministicAnalysis } from "./deterministic";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
-export type AnalyzeResult = { analysis: Analysis; profile: Profile };
+export type AnalyzeMode = "hybrid" | "stats-only";
+
+export type AnalyzeResult = {
+  analysis: Analysis;
+  profile: Profile;
+  mode: AnalyzeMode;
+  notice?: string;
+};
 
 export async function analyze(rawInput: string): Promise<AnalyzeResult> {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error("ANTHROPIC_API_KEY is not set");
-  }
-
   const { profile, truncatedInput } = buildProfile(rawInput);
   if (profile.kind === "empty") {
     throw new Error("Need more data — input is empty.");
   }
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const model = process.env.ANALYSIS_MODEL || DEFAULT_MODEL;
+  const fallback = deterministicAnalysis(profile);
 
-  const userMessage = buildUserMessage(truncatedInput, profile);
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return {
+      analysis: fallback,
+      profile,
+      mode: "stats-only",
+      notice: "ANTHROPIC_API_KEY not set — showing the deterministic half only. Add the key for LLM-grade prose.",
+    };
+  }
 
-  const firstAttempt = await callModel(client, model, userMessage);
-  const parsed = tryParse(firstAttempt);
-  if (parsed.ok) return { analysis: parsed.value, profile };
+  try {
+    const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    const model = process.env.ANALYSIS_MODEL || DEFAULT_MODEL;
+    const userMessage = buildUserMessage(truncatedInput, profile);
 
-  const retry = await callModel(client, model, userMessage, {
-    priorAttempt: firstAttempt,
-    parseError: parsed.error,
-  });
-  const reparsed = tryParse(retry);
-  if (reparsed.ok) return { analysis: reparsed.value, profile };
+    const firstAttempt = await callModel(client, model, userMessage);
+    const parsed = tryParse(firstAttempt);
+    if (parsed.ok) return { analysis: parsed.value, profile, mode: "hybrid" };
 
-  throw new Error(`Model returned invalid JSON after retry: ${reparsed.error}`);
+    const retry = await callModel(client, model, userMessage, {
+      priorAttempt: firstAttempt,
+      parseError: parsed.error,
+    });
+    const reparsed = tryParse(retry);
+    if (reparsed.ok) return { analysis: reparsed.value, profile, mode: "hybrid" };
+
+    return {
+      analysis: fallback,
+      profile,
+      mode: "stats-only",
+      notice: `LLM returned invalid JSON after retry (${reparsed.error}). Showing the deterministic half.`,
+    };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return {
+      analysis: fallback,
+      profile,
+      mode: "stats-only",
+      notice: `LLM call failed (${message}). Showing the deterministic half.`,
+    };
+  }
 }
 
 function buildUserMessage(rawInput: string, profile: Profile): string {
